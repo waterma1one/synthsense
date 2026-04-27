@@ -1,0 +1,52 @@
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi==0.111.1
+uvicorn[standard]==0.30.1
+python-multipart==0.0.9
+sse-starlette==1.8.2
+aiofiles==23.2.1
+
+# ── Config & validation ───────────────────────────────────────────────────────
+pydantic==2.7.4
+pydantic-settings==2.3.4
+python-dotenv==1.0.1
+
+# ── Async HTTP ────────────────────────────────────────────────────────────────
+httpx==0.27.0
+
+# ── LLM & orchestration ───────────────────────────────────────────────────────
+groq==0.9.0
+langchain==0.2.12
+langchain-core==0.2.27
+langchain-groq==0.1.9
+langchain-community==0.2.11
+langsmith==0.1.96
+langgraph==0.1.19
+
+# ── LlamaIndex ────────────────────────────────────────────────────────────────
+llama-index-core==0.10.58
+llama-index-readers-file==0.1.30
+
+# ── Embeddings (pinned for Python 3.9 + arm64 compatibility) ─────────────────
+torch==2.1.0
+transformers==4.37.2
+sentence-transformers==2.7.0
+
+# ── Vector store ──────────────────────────────────────────────────────────────
+supabase==2.5.1
+
+# ── PDF processing ────────────────────────────────────────────────────────────
+pypdf==4.3.1
+
+# ── Eval ──────────────────────────────────────────────────────────────────────
+ragas==0.1.21
+datasets==2.20.0
+
+# ── Observability ─────────────────────────────────────────────────────────────
+structlog==24.2.0
+
+# ── Resilience ────────────────────────────────────────────────────────────────
+tenacity==8.5.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+pillow==10.4.0
+numpy==1.26.4
