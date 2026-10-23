@@ -1,417 +1,216 @@
 # SynthSense
 
-**Multimodal incident intelligence platform.** Paste logs, drop a dashboard screenshot, and watch a LangGraph agent pipeline triage, diagnose, remediate, and write a postmortem — live, streamed to the browser.
+Incident analysis for on-call engineers: paste logs or attach a dashboard screenshot, and a LangGraph pipeline triages, diagnoses, plans remediation and writes a postmortem, streaming each step to the browser.
 
-[![Python](https://img.shields.io/badge/Python-3.9+-3776AB?logo=python&logoColor=white)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://react.dev)
-[![LangGraph](https://img.shields.io/badge/LangGraph-orchestration-FF6B6B)](https://langchain-ai.github.io/langgraph/)
+[![LangGraph](https://img.shields.io/badge/LangGraph-0.1-FF6B6B)](https://langchain-ai.github.io/langgraph/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
----
+## Demo
+
+No live demo yet.
+
+<!-- SCREENSHOT: Agent timeline page mid-run, showing triage and diagnosis completed and remediation in progress. Save as docs/screenshot.png -->
 
 ## What it does
 
-An on-call engineer pastes raw logs (or drops a dashboard screenshot) into SynthSense. Within seconds, a four-agent pipeline runs:
-
-1. **Preprocess** — extracts structured entities from logs and analyzes images in parallel
-2. **Triage** — zero-shot severity classification: `critical / high / medium / low`
-3. **Diagnose** — RAG over past incidents + runbooks to find root cause (skipped on critical for speed)
-4. **Remediate** — chain-of-thought action plan with ranked immediate steps
-5. **Postmortem** — blameless summary embedded and stored so future incidents can learn from this one
-
-Every step streams to the browser in real time via SSE. Every diagnosis is automatically scored with RAGAS + an LLM judge every 10 incidents.
-
----
+- **Multimodal input.** Raw logs or a free-text description, plus an optional screenshot. Log entities are extracted with Groq (JSON mode). Images go to a LLaVA model on the Hugging Face Inference API, and results are cached in Upstash Redis by image hash for 24 hours.
+- **Triage.** Severity classification (`critical`, `high`, `medium`, `low`) with a confidence score in a single Groq call.
+- **Diagnosis with retrieval.** Embeds the incident locally with `BAAI/bge-small-en` and queries past incidents and runbook chunks in Supabase pgvector in parallel, then asks Groq for a root cause.
+- **Remediation plan.** Structured JSON: immediate steps, investigation steps, escalation threshold, estimated resolution time, runbook references.
+- **Postmortem and memory.** Writes a blameless postmortem, embeds it, and stores the incident so later diagnoses can retrieve it.
+- **Critical fast path.** `critical` incidents skip diagnosis and the postmortem and go straight from remediation to storage.
+- **Live progress.** Each graph node's output is sent to the browser as a Server-Sent Event as soon as that node finishes.
+- **Runbook ingestion.** Upload a PDF (up to 20 MB). It is split into 512-token chunks with LlamaIndex, embedded and stored. Re-uploading the same filename is skipped.
+- **Quality checks.** Every 10th incident starts a background RAGAS run (faithfulness, answer relevancy, context recall) plus an LLM judge over a sample of synthetic incidents. Results are appended to `evals.json` and charted on the Evals page.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        AGENT PIPELINE                               │
-│                                                                     │
-│  [Image / Logs / Text]                                              │
-│          │                                                          │
-│          ▼                                                          │
-│    ┌──────────────┐                                                 │
-│    │  Preprocess  │  image_processor + log_processor (parallel)    │
-│    └──────┬───────┘                                                 │
-│           │                                                         │
-│           ▼                                                         │
-│    ┌──────────────┐                                                 │
-│    │    Triage    │  Zero-shot severity: critical/high/medium/low  │
-│    └──────┬───────┘                                                 │
-│           │                                                         │
-│    ┌──────┴──────┐                                                  │
-│    │             │                                                  │
-│  CRITICAL      NORMAL                                               │
-│    │             │                                                  │
-│    │      ┌──────▼───────┐                                         │
-│    │      │   Diagnose   │  RAG: past incidents + runbooks         │
-│    │      └──────┬───────┘                                         │
-│    │             │                                                  │
-│    └──────┬──────┘                                                  │
-│           │                                                         │
-│           ▼                                                         │
-│    ┌──────────────┐                                                 │
-│    │  Remediate   │  CoT-prompted action plan (temp=0.2)           │
-│    └──────┬───────┘                                                 │
-│           │                                                         │
-│    ┌──────┴──────┐                                                  │
-│    │             │                                                  │
-│  CRITICAL      NORMAL                                               │
-│    │             │                                                  │
-│    │      ┌──────▼───────┐                                         │
-│    │      │  Postmortem  │  Blameless summary + embed + store      │
-│    │      └──────┬───────┘                                         │
-│    │             │                                                  │
-│    └──────┬──────┘                                                  │
-│           │                                                         │
-│           ▼                                                         │
-│    ┌──────────────┐                                                 │
-│    │   Supabase   │  pgvector store for future RAG                 │
-│    └──────────────┘                                                 │
-│                                                                     │
-│  Observability:  LangSmith traces every node                       │
-│  Cache:          Upstash Redis caches image analysis (24h TTL)     │
-│  Quality:        RAGAS + LLM judge scores every 10 incidents       │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Frontend["React frontend (Vite, port 3000)"]
+        Form["IncidentForm"] --> Timeline["AgentTimeline"]
+        RunbookUI["RunbookUpload"]
+        EvalUI["EvalDashboard"]
+    end
+
+    Timeline -- "POST /incidents/{id}/stream (fetch, JSON body)" --> SSE["incidents.py: StreamingResponse text/event-stream"]
+    SSE --> Stream["graph.stream_incident: incident_graph.astream(state)"]
+
+    subgraph Graph["LangGraph StateGraph(IncidentState)"]
+        Pre["preprocess: analyze_image + extract_log_entities (asyncio.gather)"]
+        Tri["triage"]
+        Dia["diagnose"]
+        Rem["remediate"]
+        PM["write_postmortem"]
+        Sto["store"]
+        Pre --> Tri
+        Tri -- "route_after_triage: not critical" --> Dia
+        Tri -- "critical" --> Rem
+        Dia --> Rem
+        Rem -- "route_after_remediate: not critical" --> PM
+        Rem -- "critical" --> Sto
+        PM --> End(["END"])
+        Sto --> End
+    end
+
+    Stream --> Pre
+    Pre -. "image hash lookup" .-> Redis[("Upstash Redis REST")]
+    Pre -. "vision" .-> HF["HF Inference API: llava-1.5-7b-hf"]
+    Tri & Dia & Rem & PM -. "chat completions" .-> Groq["Groq: llama-3.1-8b-instant"]
+    Dia -. "rpc match_incidents, match_runbook_chunks" .-> PG[("Supabase pgvector: incidents, runbook_chunks")]
+    PM & Sto -. "upsert incident + embedding" .-> PG
+
+    RunbookUI -- "POST /runbooks/upload" --> Ingest["pdf_processor.ingest_pdf: LlamaIndex SentenceSplitter"]
+    Ingest --> PG
+
+    SSE -. "every 10th incident (Redis counter)" .-> Ragas["ragas_eval.ragas_assess + llm_judge"]
+    Ragas --> EvalsFile[("backend/evals.json")]
+    EvalUI -- "GET /evals/latest, /evals/all" --> EvalsFile
 ```
 
-### Key design decisions
+Design notes:
 
-| Decision | Why |
+- The pipeline is a LangGraph `StateGraph` over a `TypedDict` state (`IncidentState` in `backend/agents/graph.py`). Each node returns only the keys it changes, and two conditional edges implement the critical fast path. The tradeoff is that a critical incident is stored without a diagnosis or postmortem.
+- Streaming is per node, not per token: `stream_incident` iterates `incident_graph.astream()` and wraps each node's update as an SSE event. Users see progress at node boundaries, and the server stays simple.
+- The frontend reads the stream with `fetch` and a `ReadableStream` instead of `EventSource`, because `EventSource` only supports GET and a base64 screenshot would not fit in a URL. A GET stream endpoint is kept for curl.
+- Vectors and incident records live in one Supabase Postgres database (pgvector), with similarity search done by two SQL functions called over RPC. Embeddings are computed locally with sentence-transformers (384 dimensions), so retrieval needs no embedding API.
+- Calls to Groq, Hugging Face, Supabase and Upstash go through `tenacity` retries with exponential backoff, because free-tier models can cold-start and rate-limit. If image analysis still fails, the pipeline continues with a fallback description.
+- LangSmith tracing is switched on through `LANGCHAIN_*` environment variables, and context retrieval is marked with `@traceable`.
+
+## Stack
+
+| Layer | In this repo |
 |---|---|
-| LangGraph `StateGraph` | Stateful, conditional routing (critical fast-path skips diagnosis) |
-| SSE over WebSocket | Unidirectional stream is simpler; no reconnect logic on server side |
-| `fetch` streaming (not `EventSource`) | Allows POST body — needed to send base64 images without URL length limits |
-| pgvector in Supabase | Zero infrastructure: vector search + relational joins in one free-tier DB |
-| Local sentence-transformers embeddings | No API cost or latency for 384-dim BAAI/bge-small-en |
-| Tenacity retry on every LLM call | HuggingFace free-tier models cold-start with 503; Groq can rate-limit |
+| Orchestration | LangGraph 0.1.19 |
+| LLM | Groq SDK, model `llama-3.1-8b-instant` (configurable) |
+| Vision | Hugging Face Inference API, `llava-hf/llava-1.5-7b-hf` |
+| Embeddings | sentence-transformers 2.7, `BAAI/bge-small-en` (local) |
+| Document parsing | LlamaIndex core (PDF reader, sentence splitter), pypdf |
+| Storage | Supabase (Postgres + pgvector) |
+| Cache and counters | Upstash Redis over REST (httpx) |
+| Evaluation | RAGAS 0.1.21, datasets, LLM judge via Groq |
+| Tracing | LangSmith |
+| Backend | FastAPI 0.111, Uvicorn, Pydantic Settings, structlog, tenacity |
+| Frontend | React 18, React Router, Vite 5, Tailwind CSS, Recharts, axios |
+| Packaging | Docker, Docker Compose |
 
----
+## Run it locally
 
-## Tech stack
+You need accounts and keys for five services. All variables are listed in `.env.example` and loaded by `backend/config.py`.
 
-| Layer | Tool | Cost |
-|---|---|---|
-| LLM | Groq llama-3.1-8b-instant | Free tier |
-| Vision | HuggingFace llava-1.5-7b-hf | Free tier |
-| Embeddings | BAAI/bge-small-en (sentence-transformers) | Local, free |
-| Vector DB | Supabase pgvector | Free tier |
-| Cache | Upstash Redis (REST) | Free tier |
-| Orchestration | LangGraph + LlamaIndex | Open source |
-| Quality | RAGAS + LLM judge | Open source |
-| Observability | LangSmith | Free tier |
-| Backend | FastAPI (async) | Open source |
-| Frontend | React + Tailwind + Recharts | Open source |
+| Variable | Service |
+|---|---|
+| `GROQ_API_KEY` | [Groq](https://console.groq.com) |
+| `HUGGINGFACE_API_KEY` | [Hugging Face](https://huggingface.co/settings/tokens) access token |
+| `SUPABASE_URL`, `SUPABASE_KEY` | [Supabase](https://supabase.com) project URL and `service_role` key |
+| `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | [Upstash](https://upstash.com) Redis REST API |
+| `LANGCHAIN_API_KEY` | [LangSmith](https://smith.langchain.com) |
 
-**Total monthly cost to run: $0** (all free tiers)
+Optional: `GROQ_MODEL`, `LOG_LEVEL`, `EVAL_EVERY_N_INCIDENTS`.
 
----
-
-## Quick start
-
-### 1. Clone and configure
+**1. Configure**
 
 ```bash
 git clone https://github.com/waterma1one/synthsense.git
 cd synthsense
-cp .env.example .env
-# Fill in your API keys — see table below
+cp .env.example .env   # then fill in the keys above
 ```
 
-### 2. Get API keys (all free)
+**2. Create the database objects.** Open the Supabase SQL editor and run the SQL block in the module docstring at the top of `backend/memory/vector_store.py`. It enables `vector`, creates the `incidents` and `runbook_chunks` tables with ivfflat indexes, and defines the `match_incidents` and `match_runbook_chunks` functions that the diagnosis step calls.
 
-| Service | Where to get it | Key format |
-|---|---|---|
-| [Groq](https://console.groq.com) | Console → API Keys | `gsk_...` |
-| [HuggingFace](https://huggingface.co/settings/tokens) | Settings → Tokens | `hf_...` |
-| [Supabase](https://supabase.com) | New Project → Settings → API | URL + `service_role` key |
-| [Upstash](https://upstash.com) | New Redis DB → REST API | REST URL + token |
-| [LangSmith](https://smith.langchain.com) | Settings → API Keys | `lsv2_pt_...` |
-
-### 3. Set up Supabase vector table
-
-Run this SQL once in your [Supabase SQL editor](https://supabase.com/dashboard/project/_/sql):
-
-```sql
-create extension if not exists vector;
-
-create table if not exists incidents (
-  id          uuid primary key default gen_random_uuid(),
-  title       text,
-  raw_input   text,
-  image_description text,
-  severity    text,
-  diagnosis   text,
-  remediation text,
-  postmortem  text,
-  embedding   vector(384),
-  created_at  timestamptz default now()
-);
-
-create index if not exists incidents_embedding_idx
-  on incidents using ivfflat (embedding vector_cosine_ops)
-  with (lists = 100);
-
-create table if not exists runbook_chunks (
-  id        uuid primary key default gen_random_uuid(),
-  source    text,
-  content   text,
-  embedding vector(384),
-  created_at timestamptz default now()
-);
-
-create index if not exists runbook_chunks_embedding_idx
-  on runbook_chunks using ivfflat (embedding vector_cosine_ops)
-  with (lists = 100);
-```
-
-### 4. Run with Docker Compose (recommended)
+**3a. Run with Docker Compose**
 
 ```bash
 docker compose up --build
 ```
 
-Open [http://localhost:3000](http://localhost:3000)
+Frontend at http://localhost:3000, API at http://localhost:8000, Swagger UI at http://localhost:8000/docs.
 
-### 5. Or run locally
+**3b. Or run without Docker** (Python 3.11, matching the backend Dockerfile, and Node 20)
 
 ```bash
-# Terminal 1 — backend
+# Terminal 1: backend
 cd backend
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 
-# Terminal 2 — frontend
+# Terminal 2: frontend
 cd frontend
 npm install
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173)
+Vite serves on http://localhost:3000 (set in `frontend/vite.config.js`), which is one of the origins allowed by the backend's CORS settings. The frontend calls `http://localhost:8000` unless `VITE_API_URL` is set.
 
----
+## API
 
-## Usage
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/incidents` | Run the whole pipeline and return the final state (form fields `description`, optional `image`) |
+| `POST` | `/incidents/{id}/stream` | SSE stream of node updates, JSON body `{description, image_b64}` (used by the UI) |
+| `GET` | `/incidents/{id}/stream` | Same stream, query parameters, for curl |
+| `GET` | `/incidents/{id}` | Stored incident record |
+| `GET` | `/incidents?limit=20` | Recent incidents (max 100) |
+| `POST` | `/runbooks/upload` | Ingest a runbook PDF |
+| `GET` | `/evals/latest`, `/evals/all` | Latest and historical evaluation records |
+| `GET` | `/health` | Liveness check |
 
-### Submit an incident
-
-Paste raw logs (or describe the issue) in the form. Optionally attach a dashboard screenshot. Click **Analyze Incident** — the agent timeline streams live as each node completes.
+Example:
 
 ```bash
-# Or via curl
 curl -X POST http://localhost:8000/incidents \
   -F "description=2024-01-15T14:23:01Z ERROR api-gateway Connection refused to payment-service:8080
-2024-01-15T14:23:02Z ERROR api-gateway Retry 1/3 failed: dial tcp 10.0.1.45:8080
 2024-01-15T14:23:05Z CRIT  payment-service Pod CrashLoopBackOff: exit code 137 (OOM)"
+
+curl -N "http://localhost:8000/incidents/$(uuidgen)/stream?description=payment-service+OOMKilled"
 ```
 
-### Upload a runbook
+Each stream event has the shape `{"incident_id": ..., "agent": "<node name>", "status": "completed", "output": {...}}`. The last event has `"agent": "done"`, and a failure produces `"agent": "error"`.
 
-Drop a PDF on the **Runbooks** page (or via curl). It gets chunked and indexed into the vector store so the Diagnose agent can cite it.
+## Tests and evaluation
 
-```bash
-curl -X POST http://localhost:8000/runbooks/upload \
-  -F "file=@./runbooks/database-recovery.pdf"
-```
+There is no unit test suite in the repository.
 
-### Stream live agent progress
-
-The React frontend uses this automatically. You can also consume it directly:
-
-```bash
-curl -N "http://localhost:8000/incidents/{incident_id}/stream?description=your+logs"
-```
-
-Each SSE event has the shape:
-```json
-{
-  "incident_id": "uuid",
-  "agent": "triage",
-  "status": "completed",
-  "output": { "severity": "high", "confidence": 0.92, ... }
-}
-```
-
-### Browse history
-
-The **History** page lists all past incidents from Supabase. Click any row to view the full agent timeline and remediation plan.
-
----
-
-## API reference
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/incidents` | Submit and run pipeline synchronously |
-| `GET` | `/incidents/{id}` | Fetch stored incident record |
-| `GET` | `/incidents` | List last N incidents (default 20) |
-| `GET` | `/incidents/{id}/stream` | SSE stream via GET (curl-friendly) |
-| `POST` | `/incidents/{id}/stream` | SSE stream via POST (supports image payload) |
-| `POST` | `/runbooks/upload` | Ingest a runbook PDF into the vector store |
-| `GET` | `/evals/latest` | Latest RAGAS + LLM judge scores |
-| `GET` | `/evals/all` | All historical scores for trend charts |
-| `GET` | `/health` | Liveness probe |
-| `GET` | `/docs` | Swagger UI |
-
----
-
-## Eval / quality
-
-SynthSense scores itself automatically every 10 incidents using two complementary approaches:
-
-### RAGAS (retrieval quality)
-
-Measures the RAG pipeline in the Diagnose agent:
-- **Faithfulness** — does the diagnosis stay grounded in retrieved context?
-- **Answer relevancy** — is the diagnosis relevant to the question?
-- **Context recall** — does retrieved context contain the ground truth?
-
-### LLM judge (generation quality)
-
-Groq-as-judge scores each diagnosis on:
-- **Accuracy** — correct root cause identified?
-- **Completeness** — all contributing factors covered?
-- **Actionability** — are remediation steps executable?
-- **Specificity** — are service names and error codes cited from evidence?
-
-Both scores appear in the **RAG Quality** dashboard with trend charts.
-
-### Run evals manually
+Evaluation runs from the `backend` directory and needs the same keys as the app:
 
 ```bash
 cd backend
-
-# Generate 20 synthetic test incidents first (uses Groq)
-python -m eval.synthetic_data generate
-
-# Run RAGAS + LLM judge assessment
-python -m eval.ragas_eval run
+python -m eval.synthetic_data generate   # 20 synthetic incidents (5 categories x 4) via Groq
+python -m eval.ragas_eval run            # diagnosis on 5 of them, scored with RAGAS + LLM judge
 ```
 
-Expected output:
-```json
-{
-  "timestamp": "2024-01-15T14:30:00+00:00",
-  "sample_size": 5,
-  "scores": {
-    "faithfulness": 0.8124,
-    "answer_relevancy": 0.7653,
-    "context_recall": 0.6891,
-    "judge": {
-      "accuracy": 0.82,
-      "completeness": 0.79,
-      "actionability": 0.91,
-      "specificity": 0.75,
-      "overall": 0.82
-    }
-  }
-}
-```
+`ragas_eval run` prints a JSON record with `timestamp`, `sample_size` and `scores` (`faithfulness`, `answer_relevancy`, `context_recall`, and a `judge` block with `accuracy`, `completeness`, `actionability`, `specificity`, `overall`), and appends it to `backend/evals.json`. No evaluation results are committed to the repository, so this README does not quote scores.
 
----
-
-## Project structure
+## Project layout
 
 ```
-synthsense/
-├── backend/
-│   ├── agents/
-│   │   ├── graph.py              # LangGraph StateGraph — pipeline wiring + routing
-│   │   ├── triage_agent.py       # Zero-shot severity classification
-│   │   ├── diagnosis_agent.py    # RAG root-cause analysis
-│   │   ├── remediation_agent.py  # CoT action plan generation
-│   │   └── postmortem_agent.py   # Blameless summary + Supabase persistence
-│   ├── api/
-│   │   ├── incidents.py          # POST/GET/SSE endpoints
-│   │   ├── runbooks.py           # PDF upload + ingestion
-│   │   └── evals.py              # RAGAS + judge score endpoints
-│   ├── eval/
-│   │   ├── ragas_eval.py         # RAGAS assessment pipeline
-│   │   ├── llm_judge.py          # Groq-as-judge scoring
-│   │   └── synthetic_data.py     # Synthetic incident generator
-│   ├── ingestion/
-│   │   ├── image_processor.py    # LLaVA vision analysis + Redis cache
-│   │   ├── log_processor.py      # Structured entity extraction from logs
-│   │   └── pdf_processor.py      # PDF chunking + embedding
-│   ├── memory/
-│   │   ├── vector_store.py       # Supabase pgvector read/write
-│   │   └── redis_cache.py        # Upstash Redis REST client
-│   ├── config.py                 # Pydantic Settings — all env vars
-│   └── main.py                   # FastAPI app + middleware
-├── frontend/
-│   └── src/
-│       ├── api/client.js         # Axios + fetch SSE streaming
-│       └── components/
-│           ├── IncidentForm.jsx  # Log/image submission
-│           ├── AgentTimeline.jsx # Live streaming view + history read view
-│           ├── RemediationCard.jsx # Interactive checklist
-│           ├── IncidentList.jsx  # History browser
-│           ├── RunbookUpload.jsx # PDF drag-and-drop upload
-│           └── EvalDashboard.jsx # RAGAS + judge gauges + trend lines
-├── docker-compose.yml
-└── .env.example
+backend/
+  agents/      LangGraph graph (graph.py) and the triage, diagnosis, remediation, postmortem nodes
+  api/         FastAPI routers: incidents (incl. SSE), runbooks, evals
+  eval/        RAGAS run, LLM judge, synthetic incident generator
+  ingestion/   Image analysis (LLaVA), log entity extraction, PDF chunking
+  memory/      Supabase pgvector access (includes setup SQL) and Upstash Redis client
+  config.py    Pydantic Settings for all environment variables
+  main.py      FastAPI app, CORS, request logging, router wiring
+frontend/
+  src/api/         axios client and fetch-based SSE reader
+  src/components/  Incident form, agent timeline, remediation checklist, history, runbook upload, eval dashboard
+docker-compose.yml
+.env.example
 ```
 
----
+## Limitations and next steps
 
-## Development
-
-### Backend
-
-```bash
-cd backend
-source venv/bin/activate
-
-# Type check
-mypy . --ignore-missing-imports
-
-# Lint
-ruff check .
-
-# Run with auto-reload
-uvicorn main:app --reload --port 8000
-```
-
-### Frontend
-
-```bash
-cd frontend
-
-# Dev server with HMR
-npm run dev
-
-# Type check (if using TypeScript)
-npm run build   # catches JSX errors
-```
-
-### Environment variables
-
-All config lives in `backend/config.py` as a Pydantic `BaseSettings` model. Every setting has a typed field with validation. Add new settings there — never import from `os.environ` directly.
-
----
-
-## Production upgrade path
-
-SynthSense is built on free tiers to be zero-cost. These are the first swaps for a real deployment:
-
-| Component | Free version | Production version | Why |
-|---|---|---|---|
-| LLM | Groq llama-3.1-8b | GPT-4o / Claude Sonnet | Better reasoning, JSON reliability |
-| Vision | llava-1.5-7b (HuggingFace) | GPT-4o Vision / Claude Vision | Much better dashboard interpretation |
-| Vector DB | Supabase pgvector (shared) | Dedicated pgvector or Pinecone | SLA, connection pooling, autoscaling |
-| Cache | Upstash Redis (REST) | ElastiCache / Redis Cluster | Lower latency, TCP connections |
-| Embeddings | BAAI/bge-small-en local | text-embedding-3-large | Higher accuracy, larger dimension |
-| Observability | LangSmith free | LangSmith Enterprise / Datadog | Full retention, alerting, SLO tracking |
-| Async workers | asyncio tasks | Celery + Redis | Durable job queues, retries, DLQ |
-| Auth | None | Auth0 / Okta | Multi-tenant, RBAC for incident data |
-| Deployment | Docker Compose | Kubernetes + Helm | Auto-scaling, rolling deploys |
-
----
+- No authentication. Anyone who can reach the API can read and write incident data.
+- Background evaluation runs as `asyncio` tasks inside the web process. A durable job queue would survive restarts and retry failures.
+- Evaluation scores the diagnosis step on synthetic incidents, not on the incidents users submit. `POST /incidents` also runs the LLM judge on the real incident, but only logs the score.
+- The models were chosen for free-tier access. A larger LLM and vision model would likely improve JSON reliability and screenshot interpretation.
+- Results go to `evals.json` on local disk, so they are not shared across instances.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
