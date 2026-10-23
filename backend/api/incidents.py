@@ -56,7 +56,7 @@ async def submit_incident(
     """
     Submit a new incident for analysis.
     Accepts a text description / raw logs and an optional dashboard screenshot.
-    Returns immediately with the incident_id; use the /stream endpoint for live progress.
+    Runs the full graph before responding; use the /stream endpoint for live progress.
     """
     incident_id = str(uuid.uuid4())
     image_b64 = ""
