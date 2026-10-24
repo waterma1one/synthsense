@@ -16,7 +16,7 @@ No live demo yet.
 
 ## What it does
 
-- **Multimodal input.** Raw logs or a free-text description, plus an optional screenshot. Log entities are extracted with Groq (JSON mode). Images go to a LLaVA model on the Hugging Face Inference API, and results are cached in Upstash Redis by image hash for 24 hours.
+- **Multimodal input.** Raw logs or a free-text description, plus an optional screenshot. Log entities are extracted with Groq (JSON mode). Images go to a vision model (default `google/gemma-4-31B-it`) through the Hugging Face router, and successful results are cached in Upstash Redis by image hash for 24 hours.
 - **Triage.** Severity classification (`critical`, `high`, `medium`, `low`) with a confidence score in a single Groq call.
 - **Diagnosis with retrieval.** Embeds the incident locally with `BAAI/bge-small-en` and queries past incidents and runbook chunks in Supabase pgvector in parallel, then asks Groq for a root cause.
 - **Remediation plan.** Structured JSON: immediate steps, investigation steps, escalation threshold, estimated resolution time, runbook references.
@@ -58,7 +58,7 @@ flowchart TD
 
     Stream --> Pre
     Pre -. "image hash lookup" .-> Redis[("Upstash Redis REST")]
-    Pre -. "vision" .-> HF["HF Inference API: llava-1.5-7b-hf"]
+    Pre -. "vision" .-> HF["HF router: gemma-4-31B-it"]
     Tri & Dia & Rem & PM -. "chat completions" .-> Groq["Groq: llama-3.1-8b-instant"]
     Dia -. "rpc match_incidents, match_runbook_chunks" .-> PG[("Supabase pgvector: incidents, runbook_chunks")]
     PM & Sto -. "upsert incident + embedding" .-> PG
@@ -86,7 +86,7 @@ Design notes:
 |---|---|
 | Orchestration | LangGraph 0.1.19 |
 | LLM | Groq SDK, model `llama-3.1-8b-instant` (configurable) |
-| Vision | Hugging Face Inference API, `llava-hf/llava-1.5-7b-hf` |
+| Vision | Hugging Face router (`router.huggingface.co`), `google/gemma-4-31B-it` |
 | Embeddings | sentence-transformers 2.7, `BAAI/bge-small-en` (local) |
 | Document parsing | LlamaIndex core (PDF reader, sentence splitter), pypdf |
 | Storage | Supabase (Postgres + pgvector) |
@@ -109,7 +109,7 @@ You need accounts and keys for five services. All variables are listed in `.env.
 | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | [Upstash](https://upstash.com) Redis REST API |
 | `LANGCHAIN_API_KEY` | [LangSmith](https://smith.langchain.com) |
 
-Optional: `GROQ_MODEL`, `LOG_LEVEL`, `EVAL_EVERY_N_INCIDENTS`.
+Optional: `GROQ_MODEL`, `HF_VISION_MODEL`, `LOG_LEVEL`, `EVAL_EVERY_N_INCIDENTS`.
 
 **1. Configure**
 
@@ -192,7 +192,7 @@ backend/
   agents/      LangGraph graph (graph.py) and the triage, diagnosis, remediation, postmortem nodes
   api/         FastAPI routers: incidents (incl. SSE), runbooks, evals
   eval/        RAGAS run, LLM judge, synthetic incident generator
-  ingestion/   Image analysis (LLaVA), log entity extraction, PDF chunking
+  ingestion/   Image analysis (vision model), log entity extraction, PDF chunking
   memory/      Supabase pgvector access (includes setup SQL) and Upstash Redis client
   config.py    Pydantic Settings for all environment variables
   main.py      FastAPI app, CORS, request logging, router wiring
@@ -208,6 +208,7 @@ docker-compose.yml
 - No authentication. Anyone who can reach the API can read and write incident data.
 - Background evaluation runs as `asyncio` tasks inside the web process. A durable job queue would survive restarts and retry failures.
 - Evaluation scores the diagnosis step on synthetic incidents, not on the incidents users submit. `POST /incidents` also runs the LLM judge on the real incident, but only logs the score.
+- The image path was moved from the retired HF Inference API (LLaVA) to the HF router. It is covered by mocked-HTTP tests only; I have not run it against a live token, and router providers for a given model can change. Set `HF_VISION_MODEL` to another vision-capable model if this one stops being served.
 - The models were chosen for free-tier access. A larger LLM and vision model would likely improve JSON reliability and screenshot interpretation.
 - Results go to `evals.json` on local disk, so they are not shared across instances.
 
