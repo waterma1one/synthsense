@@ -1,7 +1,7 @@
 from __future__ import annotations
 """
 Multimodal image analysis for SynthSense.
-Sends dashboard screenshots or error images to HuggingFace's LLaVA model
+Sends dashboard screenshots or error images to a vision model on the Hugging Face router
 and returns structured descriptions of anomalies, errors, and metrics.
 Results are cached in Upstash Redis by image hash to avoid redundant API calls.
 """
@@ -46,8 +46,8 @@ def _hash_image(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _parse_llava_response(raw_text: str) -> dict[str, Any]:
-    """Extract structured JSON from LLaVA's free-form text output."""
+def _parse_vision_response(raw_text: str) -> dict[str, Any]:
+    """Extract structured JSON from the model's free-form text output."""
     try:
         # Try to find a JSON block in the response
         match = re.search(r"\{.*\}", raw_text, re.DOTALL)
@@ -65,6 +65,17 @@ def _parse_llava_response(raw_text: str) -> dict[str, Any]:
     }
 
 
+def _image_mime(image_b64: str) -> str:
+    head = base64.b64decode(image_b64[:32] + "=" * (-len(image_b64[:32]) % 4))
+    if head.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if head.startswith(b"GIF8"):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
 @retry(
     stop=stop_after_attempt(settings.max_retries),
     wait=wait_exponential(multiplier=settings.retry_base_delay, min=2, max=30),
@@ -72,15 +83,25 @@ def _parse_llava_response(raw_text: str) -> dict[str, Any]:
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
-async def _call_llava_api(image_b64: str) -> str:
-    """Send image to HuggingFace LLaVA via Inference API."""
-    url = f"{settings.hf_api_base}/{settings.hf_vision_model}"
+async def _call_vision_api(image_b64: str) -> str:
+    """Send image to a vision model through the Hugging Face router (OpenAI-style chat API)."""
+    url = f"{settings.hf_api_base}/chat/completions"
     payload = {
-        "inputs": {
-            "prompt": _SRE_VISION_PROMPT,
-            "image": image_b64,
-        },
-        "parameters": {"max_new_tokens": 512, "temperature": 0.1},
+        "model": settings.hf_vision_model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _SRE_VISION_PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{_image_mime(image_b64)};base64,{image_b64}"},
+                    },
+                ],
+            }
+        ],
+        "max_tokens": 512,
+        "temperature": 0.1,
     }
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
@@ -88,18 +109,10 @@ async def _call_llava_api(image_b64: str) -> str:
             json=payload,
             headers={"Authorization": f"Bearer {settings.huggingface_api_key}"},
         )
-        # 503 means model is loading — tenacity will retry
-        if response.status_code == 503:
-            logger.warning("HuggingFace model loading, will retry…")
-            response.raise_for_status()
         response.raise_for_status()
         result = response.json()
 
-    if isinstance(result, list) and result:
-        return result[0].get("generated_text", "")
-    if isinstance(result, dict):
-        return result.get("generated_text", str(result))
-    return str(result)
+    return result["choices"][0]["message"]["content"] or ""
 
 
 async def analyze_image(
@@ -135,12 +148,13 @@ async def analyze_image(
         return cached
 
     try:
-        raw_text = await _call_llava_api(image_b64)
-        logger.debug("LLaVA raw response: %s", raw_text[:200])
-        result = _parse_llava_response(raw_text)
+        raw_text = await _call_vision_api(image_b64)
+        logger.debug("Vision model raw response: %s", raw_text[:200])
+        result = _parse_vision_response(raw_text)
     except Exception as exc:
         logger.error("Image analysis failed after retries: %s", exc)
-        result = {**_FALLBACK_RESULT, "error": str(exc)}
+        # Do not cache a failure: it would be served for the whole cache TTL.
+        return {**_FALLBACK_RESULT, "error": str(exc)}
 
     await cache_set(cache_key, result, ttl_seconds=settings.image_cache_ttl)
     return result

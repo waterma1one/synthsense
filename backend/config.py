@@ -23,9 +23,9 @@ class Settings(BaseSettings):
 
     # ── HuggingFace ───────────────────────────────────────────────────────────
     huggingface_api_key: str
-    hf_vision_model: str = "llava-hf/llava-1.5-7b-hf"
+    hf_vision_model: str = "google/gemma-4-31B-it"
     hf_embedding_model: str = "BAAI/bge-small-en"
-    hf_api_base: str = "https://api-inference.huggingface.co/models"
+    hf_api_base: str = "https://router.huggingface.co/v1"
 
     # ── Supabase ──────────────────────────────────────────────────────────────
     supabase_url: str
